@@ -1,11 +1,7 @@
 {
     "name": "baconflix",
     "version": "1.0.0",
-    "description": "Discord bot for NAS requests",
-    "homepage": "https://github.com/michael-han/BaconFlix#readme",
-    "bugs": {
-        "url": "https://github.com/michael-han/BaconFlix/issues"
-    },
+    "description": "A Discord bot to request new additions to Plex servers using Servarr applications. ",
     "repository": {
         "type": "git",
         "url": "git+https://github.com/michael-han/BaconFlix.git"

@@ -1,0 +1,14 @@
+version: '3.8'
+services:
+  baconflix-bot:
+    image: ghcr.io/michael-han/baconflix:latest
+    restart: unless-stopped
+    environment:
+      DISCORD_TOKEN: ${DISCORD_TOKEN}
+      DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID}
+      RADARR_API_KEY: ${RADARR_API_KEY}
+      RADARR_URL: ${RADARR_URL}
+      DISCORD_GUILD_ID: ${DISCORD_GUILD_ID}
+    # Add other environment variables as needed
+    # volumes:
+    #   - ./logs:/app/logs
