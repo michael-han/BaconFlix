@@ -1,23 +1,26 @@
 import * as request from "./request.js";
 
-const commands = {
-    request,
-};
+export const commandData = [request.data.toJSON()];
 
-export default commands;
+export function createInteractionRouter(deps) {
+    const requestHandlers = request.createRequestHandlers(deps);
 
-export function getHandlerForInteraction(interaction) {
-    if (
-        interaction.isStringSelectMenu() &&
-        interaction.customId === "movie_select"
-    ) {
-        return request.handleSelect;
-    }
-    if (interaction.isButton() && interaction.customId.startsWith("confirm_")) {
-        return request.handleConfirm;
-    }
-    if (interaction.isChatInputCommand() && commands[interaction.commandName]) {
-        return commands[interaction.commandName].execute;
-    }
-    return null;
+    return function getHandlerForInteraction(interaction) {
+        if (interaction.isChatInputCommand() && interaction.commandName === request.data.name) {
+            return requestHandlers.execute;
+        }
+        if (
+            interaction.isStringSelectMenu() &&
+            interaction.customId === request.CUSTOM_IDS.select
+        ) {
+            return requestHandlers.handleSelect;
+        }
+        if (
+            interaction.isButton() &&
+            interaction.customId.startsWith(request.CUSTOM_IDS.confirmPrefix)
+        ) {
+            return requestHandlers.handleConfirm;
+        }
+        return null;
+    };
 }
