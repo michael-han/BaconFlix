@@ -1,11 +1,12 @@
-# Use official Node.js image
-FROM node:20-alpine
+FROM node:24-alpine
 
+ENV NODE_ENV=production
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm install --production
+RUN npm ci --omit=dev && npm cache clean --force
 
-COPY . .
+COPY src ./src
 
+USER node
 CMD ["node", "src/index.js"]

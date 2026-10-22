@@ -1,14 +1,19 @@
-const RATE_LIMIT = {};
-const RATE_LIMIT_WINDOW = 10 * 60 * 1000; // 10 minutes
-const RATE_LIMIT_MAX = 3;
+// In-memory sliding window per user. A max of 0 disables rate limiting.
+export function createRateLimiter({ max, windowMs, now = Date.now }) {
+    const hits = new Map();
 
-export function isRateLimited(userId) {
-    const now = Date.now();
-    if (!RATE_LIMIT[userId]) RATE_LIMIT[userId] = [];
-    RATE_LIMIT[userId] = RATE_LIMIT[userId].filter(
-        (ts) => now - ts < RATE_LIMIT_WINDOW,
-    );
-    if (RATE_LIMIT[userId].length >= RATE_LIMIT_MAX) return true;
-    RATE_LIMIT[userId].push(now);
-    return false;
+    return {
+        hit(userId) {
+            if (max === 0) return { limited: false };
+            const time = now();
+            const recent = (hits.get(userId) ?? []).filter((ts) => time - ts < windowMs);
+            if (recent.length >= max) {
+                hits.set(userId, recent);
+                return { limited: true, retryAfterMs: windowMs - (time - recent[0]) };
+            }
+            recent.push(time);
+            hits.set(userId, recent);
+            return { limited: false };
+        },
+    };
 }

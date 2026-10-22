@@ -6,229 +6,284 @@ import {
     EmbedBuilder,
     ButtonBuilder,
     ButtonStyle,
+    InteractionContextType,
+    MessageFlags,
 } from "discord.js";
-import { searchRadarr, addMovieToRadarr, isAlreadyAdded } from "../utils/radarrHelpers.js";
-import { isRateLimited } from "../utils/rateLimit.js";
-import { checkDiskSpace } from "../utils/diskSpace.js";
+import { RadarrError } from "../radarr.js";
+import { checkPermission } from "../utils/permissions.js";
 
-const DEFAULT_QUALITY_PROFILE_ID = 8;
-const DEFAULT_ROOT_FOLDER_PATH = "/data/media/movies";
+const MAX_QUERY_LENGTH = 200;
+const MAX_SELECT_OPTIONS = 10;
 
-function buildMovieEmbed(movie, status) {
+export const CUSTOM_IDS = {
+    select: "request:select",
+    confirmPrefix: "request:confirm:",
+};
+
+export const data = new SlashCommandBuilder()
+    .setName("request")
+    .setDescription("Request a movie to be added to the server.")
+    .setContexts(InteractionContextType.Guild)
+    .addStringOption((option) =>
+        option
+            .setName("query")
+            .setDescription("Movie name, TMDB ID (tmdb:1234), or IMDb ID (imdb:tt1234567)")
+            .setRequired(true)
+            .setMaxLength(MAX_QUERY_LENGTH),
+    );
+
+function truncate(text, max) {
+    return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+function formatTitle(movie) {
+    return movie.year ? `${movie.title} (${movie.year})` : movie.title;
+}
+
+function formatBytes(bytes) {
+    const tib = bytes / 1024 ** 4;
+    return tib >= 1 ? `${tib.toFixed(1)} TB` : `${Math.round(bytes / 1024 ** 3)} GB`;
+}
+
+function posterUrl(movie) {
+    return (
+        movie.remotePoster ?? movie.images?.find((i) => i.coverType === "poster")?.remoteUrl ?? null
+    );
+}
+
+function messageEmbed(title, description, color = "Red") {
+    return new EmbedBuilder().setTitle(title).setDescription(description).setColor(color);
+}
+
+function buildMovieEmbed(movie, status, requester) {
     const embed = new EmbedBuilder()
-        .setTitle(`${movie.title} (${movie.year})`)
-        .setThumbnail(movie.remotePoster)
-        .setColor(status === "added" ? "Blue" : status === "exists" ? "Green" : "Red");
-    if (status === "added") {
-        embed.setDescription("Requested and added to Radarr!");
+        .setTitle(truncate(formatTitle(movie), 256))
+        .setURL(`https://www.themoviedb.org/movie/${movie.tmdbId}`);
+    const poster = posterUrl(movie);
+    if (poster) embed.setThumbnail(poster);
+
+    if (status === "select") {
+        embed
+            .setDescription(truncate(movie.overview || "No description.", 1000))
+            .setColor("Blurple");
     } else if (status === "exists") {
-        embed.setDescription("This movie is already available on your NAS.");
-    } else if (status === "select") {
-        embed.setDescription(movie.overview || "No description.");
-    } else if (status === "error") {
-        embed.setDescription(movie.error || "Error occurred.");
+        embed.setDescription("This movie is already on the server.").setColor("Green");
+    } else if (status === "added") {
+        embed.setDescription("Requested and added to Radarr!").setColor("Blue");
+    } else if (status === "announce") {
+        embed
+            .setDescription(`Requested by <@${requester.id}>. It'll show up once it's downloaded.`)
+            .setColor("Blue");
     }
     return embed;
 }
 
-export const data = new SlashCommandBuilder()
-    .setName("request")
-    .setDescription(
-        'Request a movie or TV show to be added to the NAS.'
-    )
-    .addStringOption((option) =>
-        option
-            .setName("query")
-            .setDescription(
-                "Name, TMDB ID (tmdb:xxxx), or IMDB ID (imdb:xxxx)"
-            )
-            .setRequired(true)
+function confirmRow(movie) {
+    return new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId(`${CUSTOM_IDS.confirmPrefix}${movie.tmdbId}`)
+            .setLabel("Confirm Request")
+            .setStyle(ButtonStyle.Primary),
     );
-
-export async function execute(interaction) {
-    const userId = interaction.user.id;
-    if (isRateLimited(userId)) {
-        if (!interaction.replied && !interaction.deferred) {
-            await interaction.reply({
-                content:
-                    "You are making requests too quickly. Please wait before trying again.",
-                flags: 64, // Ephemeral
-            });
-        }
-        return;
-    }
-    const query = interaction.options.getString("query", true);
-    await interaction.deferReply();
-    try {
-        // Check disk space
-        const hasSpace = await checkDiskSpace();
-        if (!hasSpace) {
-            await interaction.editReply({
-                embeds: [
-                    new EmbedBuilder()
-                        .setTitle("Low Disk Space")
-                        .setDescription("Warning: Less than 1TB free on NAS.")
-                        .setColor("Red"),
-                ],
-            });
-            return;
-        }
-        const results = await searchRadarr(query);
-        if (!results || results.length === 0) {
-            await interaction.editReply({
-                embeds: [
-                    new EmbedBuilder()
-                        .setTitle("No Results")
-                        .setDescription("No results found for your query.")
-                        .setColor("Red"),
-                ],
-            });
-            return;
-        }
-        // If only one result, show confirmation button
-        if (results.length === 1) {
-            const movie = results[0];
-            // Check if already exists
-            const alreadyAdded = await isAlreadyAdded(movie.tmdbId);
-            if (alreadyAdded) {
-                await interaction.editReply({
-                    embeds: [buildMovieEmbed(movie, "exists")],
-                });
-                return;
-            }
-            const confirmButton = new ButtonBuilder()
-                .setCustomId(`confirm_${movie.tmdbId}`)
-                .setLabel("Confirm Add")
-                .setStyle(ButtonStyle.Primary);
-            const row = new ActionRowBuilder().addComponents(confirmButton);
-            await interaction.editReply({
-                embeds: [buildMovieEmbed(movie, "select")],
-                components: [row],
-            });
-            return;
-        }
-        // More than one result: show select menu
-        const options = results.slice(0, 10).map((movie) =>
-            new StringSelectMenuOptionBuilder()
-                .setLabel(`${movie.title} (${movie.year})`)
-                .setDescription(
-                    movie.overview
-                        ? movie.overview.substring(0, 100)
-                        : "No description",
-                )
-                .setValue(String(movie.tmdbId))
-        );
-        const selectMenu = new StringSelectMenuBuilder()
-            .setCustomId("movie_select")
-            .setPlaceholder("Select the correct movie")
-            .addOptions(options);
-        const row = new ActionRowBuilder().addComponents(selectMenu);
-        await interaction.editReply({
-            content: "Multiple results found. Please select:",
-            components: [row],
-        });
-    } catch (error) {
-        console.log(error);
-        if (!interaction.replied && !interaction.deferred) {
-            await interaction.reply({
-                embeds: [
-                    new EmbedBuilder()
-                        .setTitle("Error")
-                        .setDescription(error.message)
-                        .setColor("Red"),
-                ],
-                flags: 64, // Ephemeral
-            });
-        } else {
-            await interaction.editReply({
-                embeds: [
-                    new EmbedBuilder()
-                        .setTitle("Error")
-                        .setDescription(error.message)
-                        .setColor("Red"),
-                ],
-            });
-        }
-    }
 }
 
-export async function handleSelect(interaction) {
-    await interaction.deferUpdate();
-    const selectedTmdbId = interaction.values[0];
-    try {
-        const results = await searchRadarr(`tmdb:${selectedTmdbId}`);
-        const movie = results.find((m) => String(m.tmdbId) === selectedTmdbId);
-        let embed;
-        if (!movie) {
-            embed = new EmbedBuilder()
-                .setTitle("Movie not found")
-                .setColor("Red");
-            await interaction.editReply({ embeds: [embed], components: [] });
-            return;
-        }
-        // Check if already exists
-        const alreadyAdded = await isAlreadyAdded(movie.tmdbId);
-        if (alreadyAdded) {
-            await interaction.editReply({ embeds: [buildMovieEmbed(movie, "exists")], components: [] });
-            return;
-        }
-        const confirmButton = new ButtonBuilder()
-            .setCustomId(`confirm_${movie.tmdbId}`)
-            .setLabel("Confirm Add")
-            .setStyle(ButtonStyle.Primary);
-        const row = new ActionRowBuilder().addComponents(confirmButton);
-        await interaction.editReply({
-            embeds: [buildMovieEmbed(movie, "select")],
-            components: [row],
+function selectRow(results) {
+    // Select menu values must be unique.
+    const unique = new Map(results.filter((m) => m.tmdbId).map((m) => [m.tmdbId, m]));
+    const options = [...unique.values()].slice(0, MAX_SELECT_OPTIONS).map((movie) =>
+        new StringSelectMenuOptionBuilder()
+            .setLabel(truncate(formatTitle(movie), 100))
+            .setDescription(truncate(movie.overview || "No description.", 100))
+            .setValue(String(movie.tmdbId)),
+    );
+    return new ActionRowBuilder().addComponents(
+        new StringSelectMenuBuilder()
+            .setCustomId(CUSTOM_IDS.select)
+            .setPlaceholder("Select the correct movie")
+            .addOptions(options),
+    );
+}
+
+export function createRequestHandlers({ radarr, rateLimiter, access, minFreeBytes, logger }) {
+    function requestLogger(interaction) {
+        return logger.child({
+            userId: interaction.user.id,
+            username: interaction.user.username,
+            guildId: interaction.guildId,
         });
-    } catch (error) {
-        console.log(error);
+    }
+
+    async function showError(interaction, error, log) {
+        log.error({ event: "request.failed", err: error }, "Request failed");
+        const message =
+            error instanceof RadarrError
+                ? error.message
+                : "Something went wrong. The error has been logged.";
         await interaction.editReply({
-            embeds: [
-                new EmbedBuilder()
-                    .setTitle("Error")
-                    .setDescription(error.message)
-                    .setColor("Red"),
-            ],
+            content: "",
+            embeds: [messageEmbed("Request failed", message)],
             components: [],
         });
     }
-}
 
-export async function handleConfirm(interaction) {
-    await interaction.deferUpdate();
-    const tmdbId = interaction.customId.replace("confirm_", "");
-    let embed;
-    try {
-        const results = await searchRadarr(`tmdb:${tmdbId}`);
-        const movie = results.find((m) => String(m.tmdbId) === tmdbId);
-        if (!movie) {
-            embed = new EmbedBuilder()
-                .setTitle("Movie not found")
-                .setColor("Red");
-        } else {
-            // No need to check alreadyAdded here, only add
-            const payload = {
-                tmdbId: movie.tmdbId,
-                title: movie.title,
-                year: movie.year,
-                qualityProfileId: DEFAULT_QUALITY_PROFILE_ID,
-                rootFolderPath: DEFAULT_ROOT_FOLDER_PATH,
-                monitored: true,
-                addOptions: { searchForMovie: true },
-            };
-            await addMovieToRadarr(payload);
-            embed = buildMovieEmbed(movie, "added");
+    // Shows the movie with a confirm button, or says it's already there.
+    async function confirmationReply(movie, log) {
+        if (await radarr.isInLibrary(movie.tmdbId)) {
+            log.info({ event: "request.exists", tmdbId: movie.tmdbId, title: movie.title });
+            return { content: "", embeds: [buildMovieEmbed(movie, "exists")], components: [] };
         }
-    } catch (error) {
-        console.log(error);
-        embed = new EmbedBuilder()
-            .setTitle("Error")
-            .setDescription(error.message)
-            .setColor("Red");
+        return {
+            content: "",
+            embeds: [buildMovieEmbed(movie, "select")],
+            components: [confirmRow(movie)],
+        };
     }
-    await interaction.editReply({
-        embeds: [embed],
-        components: [],
-    });
+
+    async function execute(interaction) {
+        const log = requestLogger(interaction);
+
+        const permission = checkPermission(interaction, access);
+        if (!permission.ok) {
+            log.info({ event: "request.denied", reason: permission.reason });
+            await interaction.reply({
+                embeds: [messageEmbed("Not allowed", permission.reason)],
+                flags: MessageFlags.Ephemeral,
+            });
+            return;
+        }
+
+        const query = interaction.options.getString("query", true).trim();
+        if (!query) {
+            await interaction.reply({
+                embeds: [messageEmbed("Empty search", "Enter a movie name or ID to search for.")],
+                flags: MessageFlags.Ephemeral,
+            });
+            return;
+        }
+
+        const limit = rateLimiter.hit(interaction.user.id);
+        if (limit.limited) {
+            const minutes = Math.max(1, Math.ceil(limit.retryAfterMs / 60000));
+            log.info({ event: "request.rate_limited" });
+            await interaction.reply({
+                embeds: [
+                    messageEmbed(
+                        "Slow down",
+                        `You're making requests too quickly. Try again in ${minutes} minute${minutes === 1 ? "" : "s"}.`,
+                    ),
+                ],
+                flags: MessageFlags.Ephemeral,
+            });
+            return;
+        }
+
+        // Everything from here is only visible to the requester; the channel
+        // gets a public announcement once a movie is actually added.
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        try {
+            if (minFreeBytes > 0) {
+                const freeSpace = await radarr.getFreeSpace();
+                if (freeSpace !== null && freeSpace < minFreeBytes) {
+                    log.warn({ event: "request.low_disk", freeSpace, minFreeBytes });
+                    await interaction.editReply({
+                        embeds: [
+                            messageEmbed(
+                                "Low disk space",
+                                `Only ${formatBytes(freeSpace)} free (minimum is ${formatBytes(minFreeBytes)}). ` +
+                                    "Requests are paused until space is freed up.",
+                            ),
+                        ],
+                    });
+                    return;
+                }
+            }
+
+            const results = await radarr.lookup(query);
+            log.info({ event: "request.searched", query, results: results.length });
+
+            if (results.length === 0) {
+                await interaction.editReply({
+                    embeds: [messageEmbed("No results", `Nothing found for "${query}".`)],
+                });
+                return;
+            }
+            if (results.length === 1) {
+                await interaction.editReply(await confirmationReply(results[0], log));
+                return;
+            }
+            await interaction.editReply({
+                content: "Multiple results found. Pick the right one:",
+                components: [selectRow(results)],
+            });
+        } catch (error) {
+            await showError(interaction, error, log);
+        }
+    }
+
+    async function handleSelect(interaction) {
+        const log = requestLogger(interaction);
+        await interaction.deferUpdate();
+        try {
+            const movie = await radarr.findByTmdbId(interaction.values[0]);
+            if (!movie) {
+                await interaction.editReply({
+                    content: "",
+                    embeds: [messageEmbed("Movie not found", "Radarr couldn't find that movie.")],
+                    components: [],
+                });
+                return;
+            }
+            await interaction.editReply(await confirmationReply(movie, log));
+        } catch (error) {
+            await showError(interaction, error, log);
+        }
+    }
+
+    async function handleConfirm(interaction) {
+        const log = requestLogger(interaction);
+        await interaction.deferUpdate();
+        const tmdbId = interaction.customId.slice(CUSTOM_IDS.confirmPrefix.length);
+        let movie;
+        try {
+            movie = await radarr.findByTmdbId(tmdbId);
+            if (!movie) {
+                await interaction.editReply({
+                    embeds: [messageEmbed("Movie not found", "Radarr couldn't find that movie.")],
+                    components: [],
+                });
+                return;
+            }
+            await radarr.addMovie(movie);
+        } catch (error) {
+            // Someone else added it between the check and the confirm.
+            if (error instanceof RadarrError && error.code === "MOVIE_EXISTS") {
+                log.info({ event: "request.exists", tmdbId, title: movie?.title });
+                await interaction.editReply({
+                    embeds: [buildMovieEmbed(movie, "exists")],
+                    components: [],
+                });
+                return;
+            }
+            await showError(interaction, error, log);
+            return;
+        }
+
+        log.info({
+            event: "request.added",
+            tmdbId: movie.tmdbId,
+            title: movie.title,
+            year: movie.year,
+        });
+        await interaction.editReply({ embeds: [buildMovieEmbed(movie, "added")], components: [] });
+        try {
+            await interaction.followUp({
+                embeds: [buildMovieEmbed(movie, "announce", interaction.user)],
+                allowedMentions: { parse: [] },
+            });
+        } catch (error) {
+            log.warn({ err: error }, "Couldn't post the public request announcement");
+        }
+    }
+
+    return { execute, handleSelect, handleConfirm };
 }
